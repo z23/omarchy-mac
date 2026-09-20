@@ -8,10 +8,11 @@ test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
 stub_bin="$test_tmp/bin"
-home="$test_tmp/home"
+test_home="$test_tmp/home"
 runtime="$test_tmp/runtime"
 calls="$test_tmp/calls"
-mkdir -p "$stub_bin" "$home" "$runtime"
+mic_script="$test_tmp/mic.sh"
+mkdir -p "$stub_bin" "$test_home" "$runtime"
 : >"$calls"
 
 cat >"$stub_bin/omarchy-hw-apple" <<'SH'
@@ -36,30 +37,33 @@ SH
 
 chmod +x "$stub_bin"/*
 
+# Redirect the legacy fallback into the fixture so this also catches regressions
+# on headless machines without a real /run/user/$UID/bus.
+sed 's|/run/user/\$UID|'"$runtime"'|g' \
+  "$ROOT/install/user/hardware/apple/mic.sh" >"$mic_script"
+python3 - "$runtime/bus" <<'PYTHON'
+import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind(sys.argv[1])
+PYTHON
+
 run_mic() {
   : >"$calls"
-  HOME="$home" OMARCHY_PATH="$ROOT" CALLS="$calls" PATH="$stub_bin:$PATH" \
-    bash -eE -c 'source "$1"' bash "$ROOT/install/user/hardware/apple/mic.sh"
+  HOME="$test_home" OMARCHY_PATH="$ROOT" CALLS="$calls" PATH="$stub_bin:$PATH" \
+    bash -eE -c 'source "$1"' bash "$mic_script"
 }
 
 # The guided --resume path: owner is logged in on tty1, sudo -i cleared
 # XDG_RUNTIME_DIR, but /run/user/$UID/bus exists. Skip the user-bus call.
-unset XDG_RUNTIME_DIR || true
+unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 run_mic
 if grep -q '^systemctl' "$calls"; then
   fail "mic setup does not call systemctl --user without XDG_RUNTIME_DIR" "$(cat "$calls")"
 fi
-pass "mic setup defers the user unit when XDG_RUNTIME_DIR is unset"
-
-touch "$runtime/bus"
-# Sockets are what the guard looks for; a regular file is not -S.
-rm -f "$runtime/bus"
-python3 - "$runtime/bus" <<'PY'
-import os, socket, sys
-path = sys.argv[1]
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.bind(path)
-PY
+mic_wants="$test_home/.config/systemd/user/graphical-session.target.wants/omarchy-asahi-mic.service"
+[[ -L $mic_wants && $(readlink "$mic_wants") == "../omarchy-asahi-mic.service" ]] ||
+  fail "mic setup keeps the service enabled for the next graphical session"
+pass "mic setup defers the enabled user unit when XDG_RUNTIME_DIR is unset"
 
 XDG_RUNTIME_DIR="$runtime" run_mic
 grep -Fx 'systemctl --user daemon-reload' "$calls" >/dev/null ||
